@@ -1,18 +1,27 @@
+import jax
+import numpy as np
 import pytest
 import torch
+from einops import rearrange
+from flax import nnx
 from torch import nn
 
 from mha import MultiHeadAttention
+from mha_einsum import MultiHeadAttentionEinsum
+from mha_jax import MultiHeadAttentionJax
 
 
+@pytest.mark.parametrize(
+    "implementation", [MultiHeadAttention, MultiHeadAttentionEinsum]
+)
 @pytest.mark.parametrize("is_causal", [False, True])
-def test_mha_matches_reference(is_causal):
+def test_torch_mha_matches_reference(implementation, is_causal):
     torch.manual_seed(0)
     d_model, num_heads = 12, 3
 
-    custom = MultiHeadAttention(num_heads, d_model).double()
+    custom = implementation(num_heads, d_model).double()
     reference_mha = nn.MultiheadAttention(
-        d_model, num_heads, dropout=0.0, batch_first=True
+        d_model, num_heads, dropout=0.0, bias=False, batch_first=True
     ).double()
 
     # PyTorch stores the Q, K, and V projections in single packed tensors.
@@ -39,3 +48,33 @@ def test_mha_matches_reference(is_causal):
 
     torch.testing.assert_close(actual_output, expected_output)
     torch.testing.assert_close(actual_attention, expected_attention)
+
+
+@pytest.mark.parametrize("is_causal", [False, True])
+def test_jax_mha_matches_reference(is_causal):
+    d_model, num_heads = 12, 3
+    input_key = jax.random.key(1)
+
+    custom = MultiHeadAttentionJax(
+        num_heads=num_heads,
+        d_model=d_model,
+        rngs=nnx.Rngs(0),
+    )
+    x = jax.random.normal(input_key, (2, 5, d_model))
+    actual_output, _ = custom(x, is_causal=is_causal)
+
+    Q = x @ custom.W_q.kernel[...]
+    K = x @ custom.W_k.kernel[...]
+    V = x @ custom.W_v.kernel[...]
+
+    Q = rearrange(Q, "b l (h d) -> b l h d", h=num_heads)
+    K = rearrange(K, "b l (h d) -> b l h d", h=num_heads)
+    V = rearrange(V, "b l (h d) -> b l h d", h=num_heads)
+
+    expected_output = jax.nn.dot_product_attention(
+        Q, K, V, is_causal=is_causal
+    )
+    expected_output = rearrange(expected_output, "b l h d -> b l (h d)")
+    expected_output = expected_output @ custom.W_o.kernel[...]
+
+    np.testing.assert_allclose(actual_output, expected_output, rtol=1e-5, atol=1e-6)
