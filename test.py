@@ -9,20 +9,27 @@ from torch import nn
 from mha import MultiHeadAttention
 from mha_einsum import MultiHeadAttentionEinsum
 from mha_jax import MultiHeadAttentionJax
+from mqa import MultiQueryAttention
+from mqa_einsum import MultiQueryAttention as MultiQueryAttentionEinops
+
+TORCH_DEVICES = ["cpu"]
+if torch.cuda.is_available():
+    TORCH_DEVICES.append("cuda")
 
 
 @pytest.mark.parametrize(
     "implementation", [MultiHeadAttention, MultiHeadAttentionEinsum]
 )
 @pytest.mark.parametrize("is_causal", [False, True])
-def test_torch_mha_matches_reference(implementation, is_causal):
+@pytest.mark.parametrize("device", TORCH_DEVICES)
+def test_torch_mha_matches_reference(implementation, is_causal, device):
     torch.manual_seed(0)
     d_model, num_heads = 12, 3
 
-    custom = implementation(num_heads, d_model).double()
+    custom = implementation(num_heads, d_model).double().to(device)
     reference_mha = nn.MultiheadAttention(
         d_model, num_heads, dropout=0.0, bias=False, batch_first=True
-    ).double()
+    ).double().to(device)
 
     # PyTorch stores the Q, K, and V projections in single packed tensors.
     with torch.no_grad():
@@ -31,10 +38,12 @@ def test_torch_mha_matches_reference(implementation, is_causal):
         )
         reference_mha.out_proj.weight.copy_(custom.W_o.weight)
 
-    x = torch.randn(2, 5, d_model, dtype=torch.float64)
+    x = torch.randn(2, 5, d_model, dtype=torch.float64, device=device)
     causal_mask = None
     if is_causal:
-        causal_mask = torch.triu(torch.ones(5, 5, dtype=torch.bool), diagonal=1)
+        causal_mask = torch.triu(
+            torch.ones(5, 5, dtype=torch.bool, device=device), diagonal=1
+        )
 
     actual_output, actual_attention = custom(x, is_causal=is_causal)
     expected_output, expected_attention = reference_mha(
@@ -78,3 +87,55 @@ def test_jax_mha_matches_reference(is_causal):
     expected_output = expected_output @ custom.W_o.kernel[...]
 
     np.testing.assert_allclose(actual_output, expected_output, rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.parametrize(
+    "implementation",
+    [
+        pytest.param(MultiQueryAttention, id="plain"),
+        pytest.param(MultiQueryAttentionEinops, id="einops"),
+    ],
+)
+@pytest.mark.parametrize("is_causal", [False, True])
+@pytest.mark.parametrize("device", TORCH_DEVICES)
+def test_mqa_matches_reference(implementation, is_causal, device):
+    torch.manual_seed(0)
+    d_model, num_heads = 12, 3
+
+    custom = implementation(num_heads, d_model).double().to(device)
+    reference_mha = nn.MultiheadAttention(
+        d_model, num_heads, dropout=0.0, bias=False, batch_first=True
+    ).double().to(device)
+
+    # Repeat the shared K/V projections so regular MHA behaves like MQA.
+    with torch.no_grad():
+        reference_mha.in_proj_weight.copy_(
+            torch.cat(
+                [
+                    custom.W_q.weight,
+                    custom.W_k.weight.repeat(num_heads, 1),
+                    custom.W_v.weight.repeat(num_heads, 1),
+                ]
+            )
+        )
+        reference_mha.out_proj.weight.copy_(custom.W_o.weight)
+
+    x = torch.randn(2, 5, d_model, dtype=torch.float64, device=device)
+    causal_mask = None
+    if is_causal:
+        causal_mask = torch.triu(
+            torch.ones(5, 5, dtype=torch.bool, device=device), diagonal=1
+        )
+
+    actual_output, actual_attention = custom(x, is_causal=is_causal)
+    expected_output, expected_attention = reference_mha(
+        query=x,
+        key=x,
+        value=x,
+        attn_mask=causal_mask,
+        need_weights=True,
+        average_attn_weights=False,
+    )
+
+    torch.testing.assert_close(actual_output, expected_output)
+    torch.testing.assert_close(actual_attention, expected_attention)
